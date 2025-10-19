@@ -115,6 +115,61 @@ void GDScriptFunction::_profile_native_call(uint64_t p_t_taken, const String &p_
 
 #endif // DEBUG_ENABLED
 
+// Helper function to determine if a method mutates its object
+static bool _is_mutating_method(Variant::Type p_type, const StringName &p_method) {
+	switch (p_type) {
+		case Variant::ARRAY: {
+			// Array mutating methods
+			return p_method == "append" ||
+				   p_method == "append_array" ||
+				   p_method == "clear" ||
+				   p_method == "erase" ||
+				   p_method == "fill" ||
+				   p_method == "insert" ||
+				   p_method == "pop_back" ||
+				   p_method == "pop_front" ||
+				   p_method == "push_back" ||
+				   p_method == "push_front" ||
+				   p_method == "remove_at" ||
+				   p_method == "resize" ||
+				   p_method == "reverse" ||
+				   p_method == "shuffle" ||
+				   p_method == "sort" ||
+				   p_method == "sort_custom";
+		}
+		case Variant::DICTIONARY: {
+			// Dictionary mutating methods
+			return p_method == "clear" ||
+				   p_method == "erase" ||
+				   p_method == "merge";
+		}
+		case Variant::PACKED_BYTE_ARRAY:
+		case Variant::PACKED_INT32_ARRAY:
+		case Variant::PACKED_INT64_ARRAY:
+		case Variant::PACKED_FLOAT32_ARRAY:
+		case Variant::PACKED_FLOAT64_ARRAY:
+		case Variant::PACKED_STRING_ARRAY:
+		case Variant::PACKED_VECTOR2_ARRAY:
+		case Variant::PACKED_VECTOR3_ARRAY:
+		case Variant::PACKED_COLOR_ARRAY: {
+			// PackedArray mutating methods
+			return p_method == "append" ||
+				   p_method == "append_array" ||
+				   p_method == "clear" ||
+				   p_method == "fill" ||
+				   p_method == "insert" ||
+				   p_method == "push_back" ||
+				   p_method == "remove_at" ||
+				   p_method == "resize" ||
+				   p_method == "reverse" ||
+				   p_method == "set" ||
+				   p_method == "sort";
+		}
+		default:
+			return false;
+	}
+}
+
 Variant GDScriptFunction::_get_default_variant_for_data_type(const GDScriptDataType &p_data_type) {
 	if (p_data_type.kind == GDScriptDataType::BUILTIN) {
 		if (p_data_type.builtin_type == Variant::ARRAY) {
@@ -979,6 +1034,80 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				GET_VARIANT_PTR(index, 1);
 				GET_VARIANT_PTR(value, 2);
 
+				// Check if this is a keyed assignment to a reactive member variable
+				bool is_reactive_member = false;
+				StringName member_name;
+				Variant old_value;
+				
+				
+				if (p_instance && variant_addresses[ADDR_TYPE_MEMBER]) {
+					// Check if dst is stored in a member variable (for keyed assignment like dict["key"] = value)
+					int member_index = -1;
+					
+					// Check if dst points directly to a member variable slot
+					Variant *members_start = p_instance->members.ptrw();
+					Variant *members_end = members_start + p_instance->members.size();
+					
+					if (dst >= members_start && dst < members_end) {
+						// dst points directly to a member variable
+						member_index = dst - members_start;
+					} else {
+						// dst might be the value stored in a member variable (for containers)
+						// In this case, we need to check if any member variable contains the same object
+						for (int i = 0; i < p_instance->members.size(); i++) {
+							if ((p_instance->members[i].get_type() == Variant::DICTIONARY || 
+							     p_instance->members[i].get_type() == Variant::ARRAY) &&
+							     dst->get_type() == p_instance->members[i].get_type()) {
+								
+								// For reference types, check if they refer to the same object
+								if (p_instance->members[i].get_type() == Variant::DICTIONARY) {
+									const Dictionary &member_dict = p_instance->members[i];
+									const Dictionary &dst_dict = *dst;
+									
+									// Check if the dictionaries are the same object by comparing their internal data pointers
+									if (member_dict.id() == dst_dict.id()) {
+										member_index = i;
+										break;
+									}
+								} else if (p_instance->members[i].get_type() == Variant::ARRAY) {
+									const Array &member_array = p_instance->members[i];
+									const Array &dst_array = *dst;
+									
+									// Check if the arrays are the same object by comparing their internal data pointers
+									if (member_array.id() == dst_array.id()) {
+										member_index = i;
+										break;
+									}
+								}
+							}
+						}
+					}
+					
+					// Check if this member is reactive
+					if (member_index >= 0) {
+						GDScript *script = p_instance->script.ptr();
+						if (script) {
+							for (const KeyValue<StringName, GDScript::MemberInfo> &E : script->member_indices) {
+								if (E.value.index == member_index) {
+									member_name = E.key;
+									// Check reactive properties in this script and all base scripts
+									GDScript *current_script = script;
+									while (current_script && !is_reactive_member) {
+										if (current_script->reactive_properties.has(member_name)) {
+											is_reactive_member = true;
+											// Get old value before modification (make a deep copy for reference types)
+											old_value = p_instance->members[member_index].duplicate(true);
+											break;
+										}
+										current_script = current_script->_base;
+									}
+									break;
+								}
+							}
+						}
+					}
+				}
+
 				bool valid;
 #ifdef DEBUG_ENABLED
 				Variant::VariantSetError err_code;
@@ -986,6 +1115,17 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 #else
 				dst->set(*index, *value, &valid);
 #endif
+				
+				// Notify reactive property change if this was a keyed assignment on a reactive member
+				if (valid && is_reactive_member && old_value != *dst) {
+					// Use a static guard to prevent recursion during signal emission
+					static thread_local bool in_reactive_notification = false;
+					if (!in_reactive_notification) {
+						in_reactive_notification = true;
+						p_instance->owner->_notify_reactive_property_changed(member_name, old_value, *dst);
+						in_reactive_notification = false;
+					}
+				}
 #ifdef DEBUG_ENABLED
 				if (!valid) {
 					if (dst->is_read_only()) {
@@ -1025,12 +1165,97 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				GET_VARIANT_PTR(index, 1);
 				GET_VARIANT_PTR(value, 2);
 
+				// Check if this is a keyed assignment to a reactive member variable
+				bool is_reactive_member = false;
+				StringName member_name;
+				Variant old_value;
+				
+				
+				if (p_instance && variant_addresses[ADDR_TYPE_MEMBER]) {
+					// Check if dst is stored in a member variable (for keyed assignment like dict["key"] = value)
+					int member_index = -1;
+					
+					// Check if dst points directly to a member variable slot
+					Variant *members_start = p_instance->members.ptrw();
+					Variant *members_end = members_start + p_instance->members.size();
+					
+					if (dst >= members_start && dst < members_end) {
+						// dst points directly to a member variable
+						member_index = dst - members_start;
+					} else {
+						// dst might be the value stored in a member variable (for containers)
+						// In this case, we need to check if any member variable contains the same object
+						for (int i = 0; i < p_instance->members.size(); i++) {
+							if ((p_instance->members[i].get_type() == Variant::DICTIONARY || 
+								p_instance->members[i].get_type() == Variant::ARRAY) &&
+								dst->get_type() == p_instance->members[i].get_type()) {
+								
+								// For reference types, check if they refer to the same object
+								if (p_instance->members[i].get_type() == Variant::DICTIONARY) {
+									const Dictionary &member_dict = p_instance->members[i];
+									const Dictionary &dst_dict = *dst;
+									
+									// Check if the dictionaries are the same object by comparing their internal data pointers
+									if (member_dict.id() == dst_dict.id()) {
+										member_index = i;
+										break;
+									}
+								} else if (p_instance->members[i].get_type() == Variant::ARRAY) {
+									const Array &member_array = p_instance->members[i];
+									const Array &dst_array = *dst;
+									
+									// Check if the arrays are the same object by comparing their internal data pointers
+									if (member_array.id() == dst_array.id()) {
+										member_index = i;
+										break;
+									}
+								}
+							}
+						}
+					}
+					
+					// Check if this member is reactive
+					if (member_index >= 0) {
+						GDScript *script = p_instance->script.ptr();
+						if (script) {
+							for (const KeyValue<StringName, GDScript::MemberInfo> &E : script->member_indices) {
+								if (E.value.index == member_index) {
+									member_name = E.key;
+									// Check reactive properties in this script and all base scripts
+									GDScript *current_script = script;
+									while (current_script && !is_reactive_member) {
+										if (current_script->reactive_properties.has(member_name)) {
+											is_reactive_member = true;
+											// Get old value before modification (make a deep copy for reference types)
+											old_value = p_instance->members[member_index].duplicate(true);
+											break;
+										}
+										current_script = current_script->_base;
+									}
+									break;
+								}
+							}
+						}
+					}
+				}
+
 				int index_setter = _code_ptr[ip + 4];
 				GD_ERR_BREAK(index_setter < 0 || index_setter >= _keyed_setters_count);
 				const Variant::ValidatedKeyedSetter setter = _keyed_setters_ptr[index_setter];
 
 				bool valid;
 				setter(dst, index, value, &valid);
+				
+				// Notify reactive property change if this was a keyed assignment on a reactive member
+				if (valid && is_reactive_member && old_value != *dst) {
+					// Use a static guard to prevent recursion during signal emission
+					static thread_local bool in_reactive_notification = false;
+					if (!in_reactive_notification) {
+						in_reactive_notification = true;
+						p_instance->owner->_notify_reactive_property_changed(member_name, old_value, *dst);
+						in_reactive_notification = false;
+					}
+				}
 
 #ifdef DEBUG_ENABLED
 				if (!valid) {
@@ -1203,8 +1428,54 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				GD_ERR_BREAK(indexname < 0 || indexname >= _global_names_count);
 				const StringName *index = &_global_names_ptr[indexname];
 
+				// Check if this is a named assignment to a reactive member variable
+				bool is_reactive_member = false;
+				StringName member_name;
+				Variant old_value;
+
+				if (p_instance && variant_addresses[ADDR_TYPE_MEMBER]) {
+					// Check if dst is stored in a member variable (for named assignment like dict.new_prop = value)
+					int member_index = -1;
+					Variant *members_start = p_instance->members.ptrw();
+					Variant *members_end = members_start + p_instance->members.size();
+					if (dst >= members_start && dst < members_end) {
+						member_index = dst - members_start;
+					}
+					// Check if this member is reactive
+					if (member_index >= 0) {
+						GDScript *script = p_instance->script.ptr();
+						if (script) {
+							for (const KeyValue<StringName, GDScript::MemberInfo> &E : script->member_indices) {
+								if (E.value.index == member_index) {
+									member_name = E.key;
+									GDScript *current_script = script;
+									while (current_script && !is_reactive_member) {
+										if (current_script->reactive_properties.has(member_name)) {
+											is_reactive_member = true;
+											old_value = p_instance->members[member_index].duplicate(true);
+											break;
+										}
+										current_script = current_script->_base;
+									}
+									break;
+								}
+							}
+						}
+					}
+				}
+
 				bool valid;
 				dst->set_named(*index, *value, valid);
+
+				// Notify reactive property change if this was a named assignment on a reactive member
+				if (valid && is_reactive_member && old_value != *dst) {
+					static thread_local bool in_reactive_notification = false;
+					if (!in_reactive_notification) {
+						in_reactive_notification = true;
+						p_instance->owner->_notify_reactive_property_changed(member_name, old_value, *dst);
+						in_reactive_notification = false;
+					}
+				}
 
 #ifdef DEBUG_ENABLED
 				if (!valid) {
@@ -1239,7 +1510,51 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				GD_ERR_BREAK(index_setter < 0 || index_setter >= _setters_count);
 				const Variant::ValidatedSetter setter = _setters_ptr[index_setter];
 
+				// Check if this is a named assignment to a reactive member variable
+				bool is_reactive_member = false;
+				StringName member_name;
+				Variant old_value;
+
+				if (p_instance && variant_addresses[ADDR_TYPE_MEMBER]) {
+					int member_index = -1;
+					Variant *members_start = p_instance->members.ptrw();
+					Variant *members_end = members_start + p_instance->members.size();
+					if (dst >= members_start && dst < members_end) {
+						member_index = dst - members_start;
+					}
+					if (member_index >= 0) {
+						GDScript *script = p_instance->script.ptr();
+						if (script) {
+							for (const KeyValue<StringName, GDScript::MemberInfo> &E : script->member_indices) {
+								if (E.value.index == member_index) {
+									member_name = E.key;
+									GDScript *current_script = script;
+									while (current_script && !is_reactive_member) {
+										if (current_script->reactive_properties.has(member_name)) {
+											is_reactive_member = true;
+											old_value = p_instance->members[member_index].duplicate(true);
+											break;
+										}
+										current_script = current_script->_base;
+									}
+									break;
+								}
+							}
+						}
+					}
+				}
+
+				Variant old_dst = dst->duplicate(true);
 				setter(dst, value);
+
+				if (is_reactive_member && old_value != *dst) {
+					static thread_local bool in_reactive_notification = false;
+					if (!in_reactive_notification) {
+						in_reactive_notification = true;
+						p_instance->owner->_notify_reactive_property_changed(member_name, old_value, *dst);
+						in_reactive_notification = false;
+					}
+				}
 				ip += 4;
 			}
 			DISPATCH_OPCODE;
@@ -1299,7 +1614,27 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				bool valid;
 #ifndef DEBUG_ENABLED
 				ClassDB::set_property(p_instance->owner, *index, *src, &valid);
+				bool ok = ClassDB::set_property(p_instance->owner, *index, *src, &valid);
+				// Check if this is a reactive property and capture old value before calling Object::set()
+				bool is_reactive = false;
+				Variant old_value;
+				GDScript *script = p_instance->script.ptr();
+				if (script && script->reactive_properties.has(*index)) {
+					is_reactive = true;
+					old_value = p_instance->owner->get(*index).duplicate(true);
+				}
+				// Notify reactive property change if needed (only if value actually changed)
+				if (ok && is_reactive && old_value != *src) {
+					// Use a static guard to prevent recursion during signal emission
+					static thread_local bool in_reactive_notification = false;
+					if (!in_reactive_notification) {
+						in_reactive_notification = true;
+						p_instance->owner->_notify_reactive_property_changed(*index, old_value, *src);
+						in_reactive_notification = false;
+					}
+				}
 #else
+				// Use Object::set() which properly handles both ClassDB properties and script members
 				bool ok = ClassDB::set_property(p_instance->owner, *index, *src, &valid);
 				if (!ok) {
 					err_text = "Internal error setting property: " + String(*index);
@@ -1309,6 +1644,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 					OPCODE_BREAK;
 				}
 #endif
+
 				ip += 3;
 			}
 			DISPATCH_OPCODE;
@@ -1328,6 +1664,9 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 					OPCODE_BREAK;
 				}
 #endif
+
+				// Use Object::get() which properly handles both ClassDB properties and script members
+				*dst = p_instance->owner->get(*index);
 				ip += 3;
 			}
 			DISPATCH_OPCODE;
@@ -1373,7 +1712,60 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				GET_VARIANT_PTR(dst, 0);
 				GET_VARIANT_PTR(src, 1);
 
-				*dst = *src;
+				// Check if this is assignment to a member variable by comparing dst with member array pointers
+				if (p_instance && variant_addresses[ADDR_TYPE_MEMBER]) {
+					// Check if dst points to one of the member variables
+					int member_index = -1;
+					for (int i = 0; i < p_instance->members.size(); i++) {
+						if (dst == &p_instance->members[i]) {
+							member_index = i;
+							break;
+						}
+					}
+					
+					// Check if this member is reactive by finding its name
+					GDScript *script = p_instance->script.ptr();
+					bool is_reactive = false;
+					StringName member_name;
+					Variant old_value;
+					
+					if (member_index >= 0 && script) {
+						for (const KeyValue<StringName, GDScript::MemberInfo> &E : script->member_indices) {
+							if (E.value.index == member_index) {
+								member_name = E.key;
+								// Check reactive properties in this script and all base scripts
+								GDScript *current_script = script;
+								while (current_script && !is_reactive) {
+									if (current_script->reactive_properties.has(member_name)) {
+										is_reactive = true;
+										// Get old value from the actual member
+										old_value = p_instance->members[member_index];
+										break;
+									}
+									current_script = current_script->_base;
+								}
+								break;
+							}
+						}
+					}
+					
+					// Perform the assignment
+					*dst = *src;
+					
+					// Notify reactive property change if needed (only if value actually changed)
+					if (is_reactive && old_value != *src) {
+						// Use a static guard to prevent recursion during signal emission
+						static thread_local bool in_reactive_notification = false;
+						if (!in_reactive_notification) {
+							in_reactive_notification = true;
+							p_instance->owner->_notify_reactive_property_changed(member_name, old_value, *src);
+							in_reactive_notification = false;
+						}
+					}
+				} else {
+					// Regular assignment (not a member variable)
+					*dst = *src;
+				}
 
 				ip += 3;
 			}
@@ -1417,6 +1809,40 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				Variant::Type var_type = (Variant::Type)_code_ptr[ip + 3];
 				GD_ERR_BREAK(var_type < 0 || var_type >= Variant::VARIANT_MAX);
 
+				// Check if this is assignment to a member variable by comparing dst with member array pointers
+				bool is_reactive = false;
+				StringName member_name;
+				Variant old_value;
+				
+				if (p_instance && variant_addresses[ADDR_TYPE_MEMBER]) {
+					// Check if dst points to one of the member variables
+					int member_index = -1;
+					for (int i = 0; i < p_instance->members.size(); i++) {
+						if (dst == &p_instance->members[i]) {
+							member_index = i;
+							break;
+						}
+					}
+					
+					// Check if this member is reactive by finding its name
+					GDScript *script = p_instance->script.ptr();
+					
+					if (member_index >= 0 && script) {
+						for (const KeyValue<StringName, GDScript::MemberInfo> &E : script->member_indices) {
+							if (E.value.index == member_index) {
+								member_name = E.key;
+								if (script->reactive_properties.has(member_name)) {
+									is_reactive = true;
+									// Get old value from the actual member
+									old_value = p_instance->members[member_index];
+								}
+								break;
+							}
+						}
+					}
+				}
+
+				// Perform the assignment
 				if (src->get_type() != var_type) {
 #ifdef DEBUG_ENABLED
 					if (Variant::can_convert_strict(src->get_type(), var_type)) {
@@ -1432,6 +1858,17 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				} else {
 #endif // DEBUG_ENABLED
 					*dst = *src;
+				}
+
+				// Notify reactive property change if needed (only if value actually changed)
+				if (is_reactive && old_value != *src) {
+					// Use a static guard to prevent recursion during signal emission
+					static thread_local bool in_reactive_notification = false;
+					if (!in_reactive_notification) {
+						in_reactive_notification = true;
+						p_instance->owner->_notify_reactive_property_changed(member_name, old_value, *src);
+						in_reactive_notification = false;
+					}
 				}
 
 				ip += 4;
@@ -1907,6 +2344,34 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				GET_INSTRUCTION_ARG(base, argc);
 				Variant **argptrs = instruction_args;
 
+				// Store old values of all reactive members before method call
+				HashMap<StringName, Variant> reactive_member_old_values;
+				
+				if (p_instance && _is_mutating_method(base->get_type(), *methodname)) {
+					GDScript *script = p_instance->script.ptr();
+					if (script) {
+						// Check all reactive properties across inheritance chain
+						GDScript *current_script = script;
+						while (current_script) {
+							for (const StringName &reactive_prop : current_script->reactive_properties) {
+								// Find the member index for this reactive property
+								if (script->member_indices.has(reactive_prop)) {
+									int member_index = script->member_indices[reactive_prop].index;
+									if (member_index >= 0 && member_index < p_instance->members.size()) {
+										// Store old value if we haven't already stored it
+										if (!reactive_member_old_values.has(reactive_prop)) {
+											// Make a deep copy for reference types to avoid sharing the same object
+											Variant old_value = p_instance->members[member_index];
+											reactive_member_old_values[reactive_prop] = old_value.duplicate(true);
+										}
+									}
+								}
+							}
+							current_script = current_script->_base;
+						}
+					}
+				}
+
 #ifdef DEBUG_ENABLED
 				uint64_t call_time = 0;
 
@@ -1954,6 +2419,40 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				} else {
 					base->callp(*methodname, (const Variant **)argptrs, argc, temp_ret, err);
 				}
+				
+				// Check if any reactive member values changed after the method call
+				if (err.error == Callable::CallError::CALL_OK && !reactive_member_old_values.is_empty()) {
+					GDScript *script = p_instance->script.ptr();
+					if (script) {
+						// Use a static guard to prevent recursion during signal emission
+						static thread_local bool in_reactive_notification = false;
+						if (!in_reactive_notification) {
+							in_reactive_notification = true;
+							
+							// Check each reactive property for changes
+							for (const KeyValue<StringName, Variant> &E : reactive_member_old_values) {
+								StringName prop_name = E.key;
+								Variant old_value = E.value;
+								
+								// Find current value
+								if (script->member_indices.has(prop_name)) {
+									int member_index = script->member_indices[prop_name].index;
+									if (member_index >= 0 && member_index < p_instance->members.size()) {
+										Variant new_value = p_instance->members[member_index];
+										
+										// If value changed, emit signal
+										if (old_value != new_value) {
+											p_instance->owner->_notify_reactive_property_changed(prop_name, old_value, new_value);
+										}
+									}
+								}
+							}
+							
+							in_reactive_notification = false;
+						}
+					}
+				}
+				
 #ifdef DEBUG_ENABLED
 
 				if (GDScriptLanguage::get_singleton()->profiling) {

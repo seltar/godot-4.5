@@ -163,6 +163,7 @@ struct PropertyInfo {
 	PropertyHint hint = PROPERTY_HINT_NONE;
 	String hint_string;
 	uint32_t usage = PROPERTY_USAGE_DEFAULT;
+	bool reactive = false; // New field for reactive properties
 
 	// If you are thinking about adding another member to this class, ask the maintainer (Juan) first.
 
@@ -209,7 +210,8 @@ struct PropertyInfo {
 				(class_name == p_info.class_name) &&
 				(hint == p_info.hint) &&
 				(hint_string == p_info.hint_string) &&
-				(usage == p_info.usage));
+				(usage == p_info.usage) &&
+				(reactive == p_info.reactive));
 	}
 
 	bool operator<(const PropertyInfo &p_info) const {
@@ -643,6 +645,7 @@ private:
 	friend struct _ObjectSignalLock;
 	mutable Mutex *signal_mutex = nullptr;
 	HashMap<StringName, SignalData> signal_map;
+	HashMap<StringName, StringName> reactive_signals; // Maps property name to signal name for reactive properties
 	List<Connection> connections;
 #ifdef DEBUG_ENABLED
 	SafeRefCount _lock_index;
@@ -979,6 +982,12 @@ public:
 	DEBUG_VIRTUAL void disconnect(const StringName &p_signal, const Callable &p_callable);
 	DEBUG_VIRTUAL bool is_connected(const StringName &p_signal, const Callable &p_callable) const;
 	DEBUG_VIRTUAL bool has_connections(const StringName &p_signal) const;
+
+	// Reactive property methods
+	void set_property_reactive(const StringName &p_property, bool p_reactive);
+	bool is_property_reactive(const StringName &p_property) const;
+	StringName get_property_signal_name(const StringName &p_property) const;
+	void _notify_reactive_property_changed(const StringName &p_property, const Variant &p_old_value, const Variant &p_new_value);
 
 	template <typename... VarArgs>
 	void call_deferred(const StringName &p_name, VarArgs... p_args) {

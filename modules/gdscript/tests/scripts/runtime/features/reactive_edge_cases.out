@@ -1,0 +1,10 @@
+GDTEST_OK
+Testing multiple assignments:
+Counter: 0 -> 1
+Counter: 1 -> 2
+Counter: 2 -> 3
+Message: 'start' -> 'middle'
+Message: 'middle' -> 'end'
+Assigning same value (should not trigger signal):
+Message: 'end' -> ''
+Counter: 3 -> 0

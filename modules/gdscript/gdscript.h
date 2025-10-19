@@ -109,6 +109,7 @@ class GDScript : public Script {
 	HashMap<StringName, Ref<GDScript>> subclasses;
 	HashMap<StringName, MethodInfo> _signals;
 	Dictionary rpc_config;
+	HashSet<StringName> reactive_properties; // Properties marked with @reactive annotation
 
 public:
 	struct LambdaInfo {

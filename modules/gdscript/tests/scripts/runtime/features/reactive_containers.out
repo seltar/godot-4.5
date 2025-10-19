@@ -1,0 +1,28 @@
+GDTEST_OK
+Initial values:
+items: []
+Setting items to [1, 2, 3]
+Items changed signal: [] -> [1, 2, 3]
+Array signal count: 1
+Last array old: []
+Last array new: [1, 2, 3]
+Appending 4 to items
+Items changed signal: [1, 2, 3] -> [1, 2, 3, 4]
+Array signal count: 2
+Last array old: [1, 2, 3]
+Last array new: [1, 2, 3, 4]
+Initial values:
+inventory: {  }
+Setting inventory to {'sword': 1, 'potion': 3}
+Inventory changed signal: {  } -> { "sword": 1, "potion": 3 }
+Dict signal count: 1
+Last dict old: {  }
+Last dict new: { "sword": 1, "potion": 3 }
+Inventory changed signal: { "sword": 1, "potion": 3 } -> { "sword": 1, "potion": 3, "shield": 1 }
+Dict signal count after modification: 2
+Last dict old after modification: { "sword": 1, "potion": 3 }
+Last dict new after modification: { "sword": 1, "potion": 3, "shield": 1 }
+Inventory changed signal: { "sword": 1, "potion": 3, "shield": 1 } -> { "sword": 1, "potion": 3, "shield": 2 }
+Dict signal count after modification: 3
+Last dict old after modification: { "sword": 1, "potion": 3, "shield": 1 }
+Last dict new after modification: { "sword": 1, "potion": 3, "shield": 2 }

@@ -1,0 +1,8 @@
+GDTEST_OK
+Testing Object reactive property methods
+Is test_prop reactive: true
+Signal name for test_prop: test_prop_changed
+Property changed signal: <null> -> initial_value
+Property changed signal: initial_value -> changed_value
+Is test_prop reactive after removal: false
+Total signals received: 2

@@ -353,10 +353,12 @@ void Object::set(const StringName &p_name, const Variant &p_value, bool *r_valid
 	} else {
 		Variant **V = metadata_properties.getptr(p_name);
 		if (V) {
+			Variant old_value = **V;
 			**V = p_value;
 			if (r_valid) {
 				*r_valid = true;
 			}
+			_notify_reactive_property_changed(p_name, old_value, p_value);
 			return;
 		} else if (p_name.operator String().begins_with("metadata/")) {
 			// Must exist, otherwise duplicate() will not work.
@@ -1100,6 +1102,7 @@ bool Object::has_meta(const StringName &p_name) const {
 void Object::set_meta(const StringName &p_name, const Variant &p_value) {
 	if (p_value.get_type() == Variant::NIL) {
 		if (metadata.has(p_name)) {
+			Variant old_value = metadata[p_name];
 			metadata.erase(p_name);
 
 			const String &sname = p_name;
@@ -1108,13 +1111,20 @@ void Object::set_meta(const StringName &p_name, const Variant &p_value) {
 				// Metadata starting with _ don't show up in the inspector, so no need to update.
 				notify_property_list_changed();
 			}
+			
+			// Check if this is a reactive property and emit signal
+			_notify_reactive_property_changed(p_name, old_value, p_value);
 		}
 		return;
 	}
 
 	HashMap<StringName, Variant>::Iterator E = metadata.find(p_name);
 	if (E) {
+		Variant old_value = E->value;
 		E->value = p_value;
+		
+		// Check if this is a reactive property and emit signal
+		_notify_reactive_property_changed(p_name, old_value, p_value);
 	} else {
 		ERR_FAIL_COND_MSG(!p_name.operator String().is_valid_ascii_identifier(), vformat("Invalid metadata identifier: '%s'.", p_name));
 		Variant *V = &metadata.insert(p_name, p_value)->value;
@@ -1124,6 +1134,9 @@ void Object::set_meta(const StringName &p_name, const Variant &p_value) {
 		if (!sname.begins_with("_")) {
 			notify_property_list_changed();
 		}
+		
+		// Check if this is a reactive property and emit signal (old value is null for new metadata)
+		_notify_reactive_property_changed(p_name, Variant(), p_value);
 	}
 }
 
@@ -1644,6 +1657,64 @@ void Object::disconnect(const StringName &p_signal, const Callable &p_callable) 
 	_disconnect(p_signal, p_callable);
 }
 
+// Reactive property methods implementation
+void Object::set_property_reactive(const StringName &p_property, bool p_reactive) {
+	OBJ_SIGNAL_LOCK
+
+	if (p_reactive) {
+		// Create a signal for this property if it doesn't exist
+		String signal_name = String(p_property) + "_changed";
+		StringName signal_sname = StringName(signal_name);
+		
+		if (!reactive_signals.has(p_property)) {
+			reactive_signals[p_property] = signal_sname;
+			
+			// Create the signal with old_value and new_value parameters
+			MethodInfo signal_info;
+			signal_info.name = signal_sname;
+			signal_info.arguments.push_back(PropertyInfo(Variant::NIL, "old_value", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT));
+			signal_info.arguments.push_back(PropertyInfo(Variant::NIL, "new_value", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT));
+			
+			// Add the signal using the proper method
+			add_user_signal(signal_info);
+		}
+	} else {
+		// Remove the reactive signal if it exists
+		if (reactive_signals.has(p_property)) {
+			StringName signal_name = reactive_signals[p_property];
+			reactive_signals.erase(p_property);
+			
+			// Remove the signal if it has no connections
+			SignalData *s = signal_map.getptr(signal_name);
+			if (s && s->slot_map.is_empty() && s->removable) {
+				signal_map.erase(signal_name);
+			}
+		}
+	}
+}
+
+bool Object::is_property_reactive(const StringName &p_property) const {
+	OBJ_SIGNAL_LOCK
+	return reactive_signals.has(p_property);
+}
+
+StringName Object::get_property_signal_name(const StringName &p_property) const {
+	OBJ_SIGNAL_LOCK
+	const StringName *signal_name = reactive_signals.getptr(p_property);
+	return signal_name ? *signal_name : StringName();
+}
+
+void Object::_notify_reactive_property_changed(const StringName &p_property, const Variant &p_old_value, const Variant &p_new_value) {
+	OBJ_SIGNAL_LOCK
+	
+	const StringName *signal_name = reactive_signals.getptr(p_property);
+	if (signal_name && signal_map.has(*signal_name)) {
+		// Emit the reactive property signal
+		const Variant *args[2] = { &p_old_value, &p_new_value };
+		emit_signalp(*signal_name, args, 2);
+	}
+}
+
 bool Object::_disconnect(const StringName &p_signal, const Callable &p_callable, bool p_force) {
 	ERR_FAIL_COND_V_MSG(p_callable.is_null(), false, vformat("Cannot disconnect from '%s': the provided callable is null.", p_signal)); // Should use `is_null`, see note in `connect` about the use of `is_valid`.
 	OBJ_SIGNAL_LOCK
@@ -1926,6 +1997,10 @@ void Object::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("is_queued_for_deletion"), &Object::is_queued_for_deletion);
 	ClassDB::bind_method(D_METHOD("cancel_free"), &Object::cancel_free);
+
+	ClassDB::bind_method(D_METHOD("set_property_reactive", "property", "reactive"), &Object::set_property_reactive);
+	ClassDB::bind_method(D_METHOD("is_property_reactive", "property"), &Object::is_property_reactive);
+	ClassDB::bind_method(D_METHOD("get_property_signal_name", "property"), &Object::get_property_signal_name);
 
 	ClassDB::add_virtual_method("Object", MethodInfo("free"), false);
 

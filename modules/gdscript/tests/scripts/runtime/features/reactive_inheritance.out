@@ -1,0 +1,9 @@
+GDTEST_OK
+Base class test
+Initial base_value: 42
+Base value changed: 42 -> 100
+Derived class test
+Initial derived_value: test
+Initial inherited base_value: 42
+Base inherited value changed: 42 -> 200
+Derived value changed: test -> modified

@@ -164,6 +164,16 @@ GDScriptInstance *GDScript::_create_instance(const Variant **p_args, int p_argco
 #endif
 	instance->owner->set_script_instance(instance);
 
+	/* STEP 1.5, SETUP REACTIVE PROPERTIES */
+	// Set up reactive properties for this instance and all base scripts
+	GDScript *current_script = this;
+	while (current_script) {
+		for (const StringName &prop_name : current_script->reactive_properties) {
+			instance->owner->set_property_reactive(prop_name, true);
+		}
+		current_script = current_script->_base;
+	}
+
 	/* STEP 2, INITIALIZE AND CONSTRUCT */
 	{
 		MutexLock lock(GDScriptLanguage::singleton->mutex);
@@ -1692,13 +1702,51 @@ bool GDScriptInstance::set(const StringName &p_name, const Variant &p_value) {
 					return false;
 				}
 			}
+			// Check if this is a reactive property and capture old value
+			bool is_reactive = false;
+			Variant old_value;
+			GDScript *current_script = script.ptr();
+			while (current_script && !is_reactive) {
+				if (current_script->reactive_properties.has(p_name)) {
+					is_reactive = true;
+					old_value = members[member->index];
+					break;
+				}
+				current_script = current_script->_base;
+			}
+			
 			if (likely(script->valid) && member->setter) {
 				const Variant *args = &value;
 				Callable::CallError err;
 				callp(member->setter, &args, 1, err);
-				return err.error == Callable::CallError::CALL_OK;
+				bool success = err.error == Callable::CallError::CALL_OK;
+				
+				// Notify reactive property change if setter was successful
+				// Note: The VM handles direct member assignments, this handles setter calls
+				if (success && is_reactive && old_value != value) {
+					// Use a static guard to prevent recursion during signal emission
+					static thread_local bool in_reactive_notification = false;
+					if (!in_reactive_notification) {
+						in_reactive_notification = true;
+						owner->_notify_reactive_property_changed(p_name, old_value, value);
+						in_reactive_notification = false;
+					}
+				}
+				return success;
 			} else {
 				members.write[member->index] = value;
+				
+				// For direct calls to set() (not from VM), notify reactive property change
+				// The VM will handle its own reactive notifications to avoid recursion
+				if (is_reactive && old_value != value) {
+					// Use a static guard to prevent recursion during signal emission
+					static thread_local bool in_reactive_notification = false;
+					if (!in_reactive_notification) {
+						in_reactive_notification = true;
+						owner->_notify_reactive_property_changed(p_name, old_value, value);
+						in_reactive_notification = false;
+					}
+				}
 				return true;
 			}
 		}
@@ -1719,13 +1767,43 @@ bool GDScriptInstance::set(const StringName &p_name, const Variant &p_value) {
 						return false;
 					}
 				}
+				// Check if this is a reactive static property and capture old value
+				bool is_reactive = sptr->reactive_properties.has(p_name);
+				Variant old_value;
+				if (is_reactive) {
+					old_value = sptr->static_variables[member->index];
+				}
+				
 				if (likely(sptr->valid) && member->setter) {
 					const Variant *args = &value;
 					Callable::CallError err;
 					callp(member->setter, &args, 1, err);
-					return err.error == Callable::CallError::CALL_OK;
+					bool success = err.error == Callable::CallError::CALL_OK;
+					
+					// Notify reactive property change if setter was successful
+					if (success && is_reactive && old_value != value) {
+						// Use a static guard to prevent recursion during signal emission
+						static thread_local bool in_reactive_notification = false;
+						if (!in_reactive_notification) {
+							in_reactive_notification = true;
+							owner->_notify_reactive_property_changed(p_name, old_value, value);
+							in_reactive_notification = false;
+						}
+					}
+					return success;
 				} else {
 					sptr->static_variables.write[member->index] = value;
+					
+					// Notify reactive property change for direct assignment
+					if (is_reactive && old_value != value) {
+						// Use a static guard to prevent recursion during signal emission
+						static thread_local bool in_reactive_notification = false;
+						if (!in_reactive_notification) {
+							in_reactive_notification = true;
+							owner->_notify_reactive_property_changed(p_name, old_value, value);
+							in_reactive_notification = false;
+						}
+					}
 					return true;
 				}
 			}

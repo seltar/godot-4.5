@@ -2887,6 +2887,29 @@ Error GDScriptCompiler::_prepare_compilation(GDScript *p_script, const GDScriptP
 					p_script->members.insert(name);
 				}
 
+				// Check for @reactive annotation and set up reactive property
+				bool is_reactive = false;
+				for (const GDScriptParser::AnnotationNode *annotation : variable->annotations) {
+					if (annotation->name == SNAME("@reactive")) {
+						is_reactive = true;
+						break;
+					}
+				}
+				if (is_reactive) {
+					p_script->reactive_properties.insert(name);
+					
+					// Add the reactive signal to the script's signal list
+					String signal_name = String(name) + "_changed";
+					StringName signal_sname = StringName(signal_name);
+					
+					MethodInfo signal_info;
+					signal_info.name = signal_sname;
+					signal_info.arguments.push_back(PropertyInfo(Variant::NIL, "old_value", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT));
+					signal_info.arguments.push_back(PropertyInfo(Variant::NIL, "new_value", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT));
+					
+					p_script->_signals[signal_sname] = signal_info;
+				}
+
 #ifdef TOOLS_ENABLED
 				if (variable->initializer != nullptr && variable->initializer->is_constant) {
 					p_script->member_default_values[name] = variable->initializer->reduced_value;

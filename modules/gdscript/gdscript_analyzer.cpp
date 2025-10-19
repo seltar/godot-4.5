@@ -1059,6 +1059,19 @@ void GDScriptAnalyzer::resolve_class_member(GDScriptParser::ClassNode *p_class, 
 					}
 				}
 
+				// Check for @reactive annotation - we'll generate signals after the main loop
+				bool is_reactive = false;
+				for (const GDScriptParser::AnnotationNode *annotation : member.variable->annotations) {
+					if (annotation->name == SNAME("@reactive")) {
+						is_reactive = true;
+						break;
+					}
+				}
+				if (is_reactive && !member.variable->is_static) {
+					// Store reactive variable name for signal generation after the main loop
+					p_class->reactive_variables.insert(member.variable->identifier->name);
+				}
+
 				static_context = previous_static_context;
 
 #ifdef DEBUG_ENABLED
@@ -1337,6 +1350,50 @@ void GDScriptAnalyzer::resolve_class_interface(GDScriptParser::ClassNode *p_clas
 			parser->push_warning(static_unload ? static_unload : p_class, GDScriptWarning::REDUNDANT_STATIC_UNLOAD);
 		}
 #endif // DEBUG_ENABLED
+
+		// Generate reactive signals for variables marked with @reactive
+		for (const StringName &var_name : p_class->reactive_variables) {
+			String signal_name = String(var_name) + "_changed";
+			StringName signal_sname = StringName(signal_name);
+			
+			// Skip if signal already exists (avoid duplicates)
+			if (p_class->has_member(signal_sname)) {
+				continue;
+			}
+			
+			// Create a new signal member for the reactive property
+			GDScriptParser::SignalNode *reactive_signal = parser->alloc_node<GDScriptParser::SignalNode>();
+			reactive_signal->identifier = parser->alloc_node<GDScriptParser::IdentifierNode>();
+			reactive_signal->identifier->name = signal_sname;
+			
+			// Add old_value and new_value parameters
+			GDScriptParser::ParameterNode *old_value_param = parser->alloc_node<GDScriptParser::ParameterNode>();
+			old_value_param->identifier = parser->alloc_node<GDScriptParser::IdentifierNode>();
+			old_value_param->identifier->name = "old_value";
+			reactive_signal->parameters.push_back(old_value_param);
+			
+			GDScriptParser::ParameterNode *new_value_param = parser->alloc_node<GDScriptParser::ParameterNode>();
+			new_value_param->identifier = parser->alloc_node<GDScriptParser::IdentifierNode>();
+			new_value_param->identifier->name = "new_value";
+			reactive_signal->parameters.push_back(new_value_param);
+			
+			// Create signal MethodInfo
+			MethodInfo mi = MethodInfo(signal_sname);
+			mi.arguments.push_back(PropertyInfo(Variant::NIL, "old_value", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT));
+			mi.arguments.push_back(PropertyInfo(Variant::NIL, "new_value", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT));
+			
+			reactive_signal->set_datatype(make_signal_type(mi));
+			reactive_signal->method_info = mi;
+			
+			// Add the signal to the class
+			GDScriptParser::ClassNode::Member signal_member;
+			signal_member.type = GDScriptParser::ClassNode::Member::SIGNAL;
+			signal_member.signal = reactive_signal;
+			p_class->members.push_back(signal_member);
+			
+			// Also add to the members_indices for lookup
+			p_class->members_indices[signal_sname] = p_class->members.size() - 1;
+		}
 	}
 }
 
